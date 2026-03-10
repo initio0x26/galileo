@@ -62,7 +62,7 @@ impl MapControllerConfiguration {
     ///
     /// For example, the value of `0.2` means, that every time the mouse wheel is turned, the map
     /// will be zoomed by 0.2 times.
-    pub fn zoom_apeed(&self) -> f64 {
+    pub fn zoom_speed(&self) -> f64 {
         self.zoom_speed
     }
 
@@ -112,7 +112,7 @@ impl MapControllerConfiguration {
 
     /// Sets minimum allowed resolution.
     pub fn set_min_resolution(&mut self, resolution: f64) {
-        self.max_resolution = resolution;
+        self.min_resolution = resolution;
     }
 
     /// Sensitivity for map rotation by dragging right mouse button.
@@ -142,7 +142,7 @@ impl MapControllerConfiguration {
 
     /// Minimum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn min_rotation_x(&self) -> f64 {
         self.min_rotation_x
@@ -150,7 +150,7 @@ impl MapControllerConfiguration {
 
     /// Sets minimum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn with_min_rotation_x(mut self, rotation: f64) -> Self {
         self.min_rotation_x = rotation;
@@ -159,7 +159,7 @@ impl MapControllerConfiguration {
 
     /// Sets minimum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn set_min_rotation_x(&mut self, rotation: f64) {
         self.min_rotation_x = rotation;
@@ -167,7 +167,7 @@ impl MapControllerConfiguration {
 
     /// Maximum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn max_rotation_x(&self) -> f64 {
         self.max_rotation_x
@@ -175,7 +175,7 @@ impl MapControllerConfiguration {
 
     /// Sets maximum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn with_max_rotation_x(mut self, rotation: f64) -> Self {
         self.max_rotation_x = rotation;
@@ -184,10 +184,10 @@ impl MapControllerConfiguration {
 
     /// Sets maximum allowed tilt of the map in radians.
     ///
-    /// The value of `0.0` means the map is viewd from above. The value of `PI/2` corresponds to
+    /// The value of `0.0` means the map is viewed from above. The value of `PI/2` corresponds to
     /// the map tilted horizontally.
     pub fn set_max_rotation_x(&mut self, rotation: f64) {
-        self.min_rotation_x = rotation;
+        self.max_rotation_x = rotation;
     }
 
     /// Minimum allowed rotation of the map around in radians.
@@ -231,7 +231,7 @@ impl MapControllerConfiguration {
     ///
     /// Positive values correspond to counterclockwise rotation.
     pub fn set_max_rotation_z(&mut self, rotation: f64) {
-        self.min_rotation_z = rotation;
+        self.max_rotation_z = rotation;
     }
 
     /// Disables tilting of the map by setting min and max rotation x to `0.0.
@@ -307,6 +307,16 @@ impl UserEventHandler for MapController {
             },
             UserEvent::Scroll(delta, mouse_event) => {
                 let zoom = self.get_zoom(*delta);
+                // Use the animation target resolution so rapid scrolling doesn't
+                // overshoot the limit when animations are still in flight.
+                let target_resolution = map.target_view().resolution() * zoom;
+
+                if target_resolution < self.config.min_resolution
+                    || target_resolution > self.config.max_resolution
+                {
+                    return EventPropagation::Stop;
+                }
+
                 let target = map
                     .target_view()
                     .zoom(zoom, mouse_event.screen_pointer_position);
@@ -316,6 +326,14 @@ impl UserEventHandler for MapController {
                 EventPropagation::Stop
             }
             UserEvent::Zoom(zoom, center) => {
+                let target_resolution = map.view().resolution() * zoom;
+
+                if target_resolution < self.config.min_resolution
+                    || target_resolution > self.config.max_resolution
+                {
+                    return EventPropagation::Stop;
+                }
+
                 let target = map.view().zoom(*zoom, *center);
                 let adjusted = self.adjust_target_view(target);
                 map.set_view(adjusted);
