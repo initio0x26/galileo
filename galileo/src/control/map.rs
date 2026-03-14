@@ -307,21 +307,14 @@ impl UserEventHandler for MapController {
             },
             UserEvent::Scroll(delta, mouse_event) => {
                 let zoom = self.get_zoom(*delta);
-                // Use the animation target resolution so rapid scrolling doesn't
-                // overshoot the limit when animations are still in flight.
-                let target_resolution = map.target_view().resolution() * zoom;
-
-                if target_resolution < self.config.min_resolution
-                    || target_resolution > self.config.max_resolution
-                {
-                    return EventPropagation::Stop;
-                }
 
                 let target = map
                     .target_view()
                     .zoom(zoom, mouse_event.screen_pointer_position);
                 let adjusted = self.adjust_target_view(target);
-                map.animate_to(adjusted, self.config.zoom_duration);
+                if (adjusted.resolution() - map.target_view().resolution()).abs() > f64::EPSILON {
+                    map.animate_to(adjusted, self.config.zoom_duration);
+                }
 
                 EventPropagation::Stop
             }
@@ -336,7 +329,9 @@ impl UserEventHandler for MapController {
 
                 let target = map.view().zoom(*zoom, *center);
                 let adjusted = self.adjust_target_view(target);
-                map.set_view(adjusted);
+                if (adjusted.resolution() - map.target_view().resolution()).abs() > f64::EPSILON {
+                    map.set_view(adjusted);
+                }
 
                 EventPropagation::Stop
             }
