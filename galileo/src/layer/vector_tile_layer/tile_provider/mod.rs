@@ -1,7 +1,7 @@
 //! Vector tile layer tile providers
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use galileo_mvt::MvtTile;
 use loader::VectorTileLoader;
@@ -42,6 +42,7 @@ pub struct VectorTileProvider {
     loader: Arc<dyn VectorTileLoader>,
     processor: Arc<dyn VectorTileProcessor>,
     messenger: Option<Arc<dyn Messenger>>,
+    view_resolution_bits: Arc<AtomicU64>,
 }
 
 impl Clone for VectorTileProvider {
@@ -51,6 +52,7 @@ impl Clone for VectorTileProvider {
             loader: self.loader.clone(),
             processor: self.processor.clone(),
             messenger: self.messenger.clone(),
+            view_resolution_bits: self.view_resolution_bits.clone(),
         }
     }
 }
@@ -73,7 +75,18 @@ impl VectorTileProvider {
             loader,
             processor,
             messenger: None,
+            view_resolution_bits: Arc::new(AtomicU64::new(f64::to_bits(1.0))), // default aman
         }
+    }
+
+
+pub fn set_view_resolution(&self, view_resolution: f64) {
+        self.view_resolution_bits
+            .store(view_resolution.to_bits(), Ordering::Relaxed);
+    }
+
+    fn get_view_resolution(&self) -> f64 {
+        f64::from_bits(self.view_resolution_bits.load(Ordering::Relaxed))
     }
 
     /// Return the style with the given id.
@@ -114,6 +127,8 @@ impl VectorTileProvider {
         let data_provider = self.loader.clone();
         let messenger = self.messenger.clone();
 
+         let view_resolution = self.get_view_resolution();
+
         crate::async_runtime::spawn(async move {
             let cell = {
                 let mut store = tile_store.write();
@@ -130,7 +145,9 @@ impl VectorTileProvider {
 
             log::debug!("Tile {index:?} is loaded. Preparing.");
 
-            let tile_state = Self::prepare_tile(tile_state, index, style_id, processor).await;
+           // let view_resolution = self.get_view_resolution();
+
+            let tile_state = Self::prepare_tile(tile_state, index, style_id, processor,view_resolution).await;
 
             log::debug!("tile {index:?} is prepared.");
 
@@ -200,11 +217,12 @@ impl VectorTileProvider {
         index: TileIndex,
         style_id: VtStyleId,
         processor: Arc<dyn VectorTileProcessor>,
+        view_resolution: f64, //
     ) -> PreparedTileState {
         match mvt_tile_state {
             MvtTileState::Loaded(mvt_tile) => {
                 match processor
-                    .process_tile(mvt_tile.clone(), index, style_id)
+                    .process_tile(mvt_tile.clone(), index, style_id,view_resolution)
                     .await
                 {
                     Ok(render_bundle) => PreparedTileState::Loaded(Arc::new(render_bundle)),

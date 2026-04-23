@@ -725,104 +725,305 @@ impl WorldRenderSet {
             }
         }
     }
-
     /// Add label that follows a path (Contour / LineString).
-///
-/// Semua offset disimpan dalam *pixel* (normal) dan shader map_ref mengubahnya ke world
-/// menggunakan transform.resolution (satu kali).
-///
-/// - `line_offset_px`: offset pixel ke arah normal garis (positif = kiri arah garis)
-/// - `repeat`: false = 1 label di tengah; true = label diulang sepanjang path
-/// - `min_distance_px`: jarak minimal antar label (dipakai hanya jika repeat = true)
-/// - `keep_upright`: kalau true, teks dibalik 180° saat arah garis menghadap kiri
-/// - `min_resolution`: map units per pixel (VIEW resolution) supaya spacing stabil di zoom
+    ///
+    /// - `line_offset_px`: offset dalam pixel ke arah normal garis (positif = ke "kiri" arah garis).
+    /// - `min_resolution`: map units per pixel (LOD resolution) supaya jarak di path dihitung dalam pixel.
+
+
+    pub fn add_label_on_path_repeated<N, P, C>(
+        &mut self,
+        path: &C,
+        text: &str,
+        style: &TextStyle,
+        line_offset_px: f32,
+        min_distance_px: f32,
+        keep_upright: bool,
+        min_resolution: f64,
+    ) where
+        N: AsPrimitive<f32>,
+        P: CartesianPoint3d<Num = N> + Copy,
+        C: Contour<Point = P>,
+    {
+        // ✅ visibility guard (tuning threshold sesuai kebutuhan)
+        if text.is_empty() || style.font_size < 12.0 {
+            return;
+        }
+
+        // 1) shape once
+        let shaping = match TextService::shape(text, style, Vector2::default(), self.dpi_scale_factor) {
+            Ok(s) => s,
+            Err(err) => {
+                log::error!("Error shaping text label: {err:?}");
+                return;
+            }
+        };
+
+        let TextShaping::Tessellation { glyphs, .. } = shaping else {
+            log::error!("Not supported font type (need tessellation)");
+            return;
+        };
+
+        // 2) collect path points (world)
+        let pts_raw: Vec<[f32; 3]> = path
+            .iter_points()
+            .map(|p| [p.x().as_(), p.y().as_(), p.z().as_()])
+            .collect();
+
+        if pts_raw.len() < 2 {
+            return;
+        }
+
+        // world -> pixel scale
+        let inv_res = 1.0 / (min_resolution as f32).max(1e-9);
+
+        // ✅ FIX: build aligned pts + cumulative lengths (no mismatch)
+        let Some((pts, cum_len_px, total_len_px)) = Self::build_path_metrics_px(&pts_raw, inv_res) else {
+            return;
+        };
+
+        // helper: sample anchor world [f32;3] + tangent angle at distance s_px
+        let sample = |s_px: f32| -> ([f32; 3], f32) {
+            let s_px = s_px.clamp(0.0, total_len_px);
+
+            // linear scan (MVP)
+            let mut idx = 0usize;
+            while idx + 1 < cum_len_px.len() && cum_len_px[idx + 1] < s_px {
+                idx += 1;
+            }
+
+            // idx+1 safe because cum_len_px.len() == pts.len() and both >= 2
+            let a = cum_len_px[idx];
+            let b = cum_len_px[idx + 1];
+            let t = if b > a { (s_px - a) / (b - a) } else { 0.0 };
+
+            let p0 = pts[idx];
+            let p1 = pts[idx + 1];
+
+            let x = p0[0] + (p1[0] - p0[0]) * t;
+            let y = p0[1] + (p1[1] - p0[1]) * t;
+            let z = p0[2] + (p1[2] - p0[2]) * t;
+
+            let ang = (p1[1] - p0[1]).atan2(p1[0] - p0[0]);
+
+            ([x, y, z], ang)
+        };
+
+        // 3) compute label width (px) from glyph vertices X
+        let mut min_x = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        for g in &glyphs {
+            for v in &g.vertices {
+                min_x = min_x.min(v.position[0]);
+                max_x = max_x.max(v.position[0]);
+            }
+        }
+        if !min_x.is_finite() || !max_x.is_finite() {
+            return;
+        }
+
+        let label_w = (max_x - min_x).max(0.0);
+        if label_w <= 0.0 || label_w >= total_len_px {
+            // terlalu panjang -> cenderung clamp & menumpuk
+            return;
+        }
+
+        // step minimum: spacing or label width + padding
+        let step = min_distance_px.max(label_w + 8.0);
+
+        // anti tile-dup / anti-edge clutter
+        let edge_padding = step * 0.5;
+
+        // buffer size tracking
+        let vtx_start_all = self.poly_tessellation.vertices.len();
+        let idx_start_all = self.poly_tessellation.indices.len();
+
+        // place label centers along path
+        let mut center = step * 0.5;
+        while center < total_len_px {
+            // start label so it is centered at `center`
+            let start_s = center - label_w * 0.5 - min_x;
+
+            // skip if too close to ends (reduces duplicates between adjacent tile pieces)
+            if start_s < edge_padding || (start_s + label_w) > (total_len_px - edge_padding) {
+                center += step;
+                continue;
+            }
+
+            // decide flipping based on tangent at center
+            let (_anchor_c, ang_c) = sample(center);
+            let flip = keep_upright && ang_c.cos() < 0.0;
+
+            if !flip {
+                // normal direction
+                let mut pen_x = start_s;
+
+                for g in &glyphs {
+                    // glyph bbox -> adv
+                    let mut gmin = f32::INFINITY;
+                    let mut gmax = f32::NEG_INFINITY;
+                    for v in &g.vertices {
+                        gmin = gmin.min(v.position[0]);
+                        gmax = gmax.max(v.position[0]);
+                    }
+                    if !gmin.is_finite() || !gmax.is_finite() {
+                        continue;
+                    }
+
+                    let adv = (gmax - gmin).max(0.0);
+                    if adv <= 0.01 {
+                        continue;
+                    }
+
+                    if pen_x > total_len_px {
+                        break;
+                    }
+
+                    let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
+                    let (anchor, ang) = sample(s_px);
+                    let (sin_a, cos_a) = ang.sin_cos();
+
+                    // left normal
+                    let nx = -sin_a;
+                    let ny = cos_a;
+
+                    let vertices_start = self.poly_tessellation.vertices.len() as u32;
+                    let glyph_center_x = gmin + adv * 0.5;
+
+                    for v in &g.vertices {
+                        let lx = v.position[0] - glyph_center_x;
+                        let ly = v.position[1];
+
+                        // ✅ pixel offset (shader map_ref will multiply by transform.resolution)
+                        let rx_px = lx * cos_a - ly * sin_a + nx * line_offset_px;
+                        let ry_px = lx * sin_a + ly * cos_a + ny * line_offset_px;
+
+                        self.poly_tessellation.vertices.push(PolyVertex {
+                            position: anchor,
+                            normal: [rx_px, ry_px],
+                            color: v.color.to_f32_array(),
+                            norm_limit: f32::MAX,
+                        });
+                    }
+
+                    for idx in &g.indices {
+                        self.poly_tessellation.indices.push(*idx + vertices_start);
+                    }
+
+                    pen_x += adv;
+                }
+            } else {
+                // flipped: render glyphs in reverse order, move pen backwards, and rotate angle by PI
+                let mut pen_x = start_s + label_w;
+
+                for g in glyphs.iter().rev() {
+                    let mut gmin = f32::INFINITY;
+                    let mut gmax = f32::NEG_INFINITY;
+                    for v in &g.vertices {
+                        gmin = gmin.min(v.position[0]);
+                        gmax = gmax.max(v.position[0]);
+                    }
+                    if !gmin.is_finite() || !gmax.is_finite() {
+                        continue;
+                    }
+
+                    let adv = (gmax - gmin).max(0.0);
+                    if adv <= 0.01 {
+                        continue;
+                    }
+
+                    pen_x -= adv;
+                    if pen_x > total_len_px {
+                        continue;
+                    }
+
+                    let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
+                    let (anchor, mut ang) = sample(s_px);
+
+                    // rotate 180° to keep upright
+                    ang += std::f32::consts::PI;
+
+                    let (sin_a, cos_a) = ang.sin_cos();
+                    let nx = -sin_a;
+                    let ny = cos_a;
+
+                    let vertices_start = self.poly_tessellation.vertices.len() as u32;
+                    let glyph_center_x = gmin + adv * 0.5;
+
+                    for v in &g.vertices {
+                        let lx = v.position[0] - glyph_center_x;
+                        let ly = v.position[1];
+
+                        let rx_px = lx * cos_a - ly * sin_a + nx * line_offset_px;
+                        let ry_px = lx * sin_a + ly * cos_a + ny * line_offset_px;
+
+                        self.poly_tessellation.vertices.push(PolyVertex {
+                            position: anchor,
+                            normal: [rx_px, ry_px],
+                            color: v.color.to_f32_array(),
+                            norm_limit: f32::MAX,
+                        });
+                    }
+
+                    for idx in &g.indices {
+                        self.poly_tessellation.indices.push(*idx + vertices_start);
+                    }
+                }
+            }
+
+            center += step;
+        }
+
+        // update buffer size
+        let vtx_added = self.poly_tessellation.vertices.len() - vtx_start_all;
+        let idx_added = self.poly_tessellation.indices.len() - idx_start_all;
+        self.buffer_size += vtx_added * std::mem::size_of::<PolyVertex>();
+        self.buffer_size += idx_added * std::mem::size_of::<u32>();
+    }
+
+
+
+   
 pub fn add_label_on_path<N, P, C>(
     &mut self,
     path: &C,
     text: &str,
     style: &TextStyle,
     line_offset_px: f32,
-    repeat: bool,
-    min_distance_px: f32,
-    keep_upright: bool,
-    min_resolution: f64,
+    min_resolution: f64, // harus VIEW resolution
 ) where
     N: AsPrimitive<f32>,
     P: CartesianPoint3d<Num = N> + Copy,
     C: Contour<Point = P>,
 {
-    // -----------------------------
-    // 0) Readability guards (zoom threshold + fade)
-    // -----------------------------
-    // min_resolution = world units per pixel (semakin besar => semakin zoom-out)
-    //
-    // Anda bisa adjust angka ini sesuai "feel" map Anda:
-    // - RES_FADE_START: mulai memudar (masih tampil)
-    // - RES_HIDE: lewat ini, label hilang total (untuk mencegah clutter)
-    const RES_FADE_START: f64 = 2.5;
-    const RES_HIDE: f64 = 5.0;
+    if text.is_empty() || style.font_size < 12.0 { return; }
 
-    #[inline]
-    fn fade_alpha(res: f64, fade_start: f64, hide: f64) -> f32 {
-        if res <= fade_start {
-            1.0
-        } else if res >= hide {
-            0.0
-        } else {
-            let t = ((res - fade_start) / (hide - fade_start)) as f32;
-            1.0 - t
-        }
-    }
-
-    let alpha = fade_alpha(min_resolution, RES_FADE_START, RES_HIDE);
-    if alpha <= 0.001 {
-        return; // hard hide saat zoom-out terlalu jauh
-    }
-
-    // Optional: matikan repeat otomatis ketika zoom-out (biar tidak penuh)
-    // Kalau Anda ingin repeat tetap aktif sampai batas tertentu, ubah RES_REPEAT_MAX.
-    const RES_REPEAT_MAX: f64 = 2.8;
-    let repeat = repeat && (min_resolution <= RES_REPEAT_MAX);
-
-    // guard dasar
-    if text.is_empty() || style.font_size < 12.0 {
-        return;
-    }
-
-    // 1) shape once
     let shaping = match TextService::shape(text, style, Vector2::default(), self.dpi_scale_factor) {
         Ok(s) => s,
-        Err(err) => {
-            log::error!("Error shaping text label: {err:?}");
-            return;
-        }
+        Err(err) => { log::error!("Error shaping text label: {err:?}"); return; }
     };
     let TextShaping::Tessellation { glyphs, .. } = shaping else {
         log::error!("Not supported font type (need tessellation)");
         return;
     };
 
-    // 2) collect path points (world)
-    let pts_raw: Vec<[f32; 3]> = path
-        .iter_points()
+
+    let outline_enabled = style.outline_width > 0.0 && !style.outline_color.is_transparent();
+    let outline_split = if outline_enabled { glyphs.len() / 2 } else { 0 };
+
+
+    let pts_raw: Vec<[f32; 3]> = path.iter_points()
         .map(|p| [p.x().as_(), p.y().as_(), p.z().as_()])
         .collect();
-    if pts_raw.len() < 2 {
-        return;
-    }
+    if pts_raw.len() < 2 { return; }
 
-    // world -> pixel scale
     let inv_res = 1.0 / (min_resolution as f32).max(1e-9);
 
-    // aligned pts + cumulative lengths
+    // ✅ pakai helper: pts + cum + total sudah aligned
     let Some((pts, cum_len_px, total_len_px)) = Self::build_path_metrics_px(&pts_raw, inv_res) else {
         return;
     };
-    if total_len_px <= 1.0 {
-        return;
-    }
 
-    // helper: sample anchor (world) + tangent angle at distance s_px
     let sample = |s_px: f32| -> ([f32; 3], f32) {
         let s_px = s_px.clamp(0.0, total_len_px);
 
@@ -830,7 +1031,6 @@ pub fn add_label_on_path<N, P, C>(
         while idx + 1 < cum_len_px.len() && cum_len_px[idx + 1] < s_px {
             idx += 1;
         }
-
         let a = cum_len_px[idx];
         let b = cum_len_px[idx + 1];
         let t = if b > a { (s_px - a) / (b - a) } else { 0.0 };
@@ -846,7 +1046,7 @@ pub fn add_label_on_path<N, P, C>(
         ([x, y, z], ang)
     };
 
-    // 3) label width (px) from glyph vertices X
+    // label width (px)
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     for g in &glyphs {
@@ -855,214 +1055,87 @@ pub fn add_label_on_path<N, P, C>(
             max_x = max_x.max(v.position[0]);
         }
     }
-    if !min_x.is_finite() || !max_x.is_finite() {
-        return;
-    }
+    
+    if !min_x.is_finite() || !max_x.is_finite() { return; }
 
-    let label_w = (max_x - min_x).max(0.0);
-    if label_w <= 0.0 || label_w >= total_len_px {
-        return;
-    }
+    let label_width = (max_x - min_x).max(0.0);
+    if label_width >= total_len_px { return; }
 
-    // Optional: jangan render kalau label terlalu kecil secara pixel (anti "semut")
-    const MIN_LABEL_PX: f32 = 28.0;
-    if label_w < MIN_LABEL_PX {
-        return;
-    }
+    let start_s = (total_len_px - label_width) * 0.5 - min_x;
 
-    // buffer size tracking
     let vtx_start_all = self.poly_tessellation.vertices.len();
     let idx_start_all = self.poly_tessellation.indices.len();
 
-    // offset pixel konsisten dengan shape()
-    let base_off = line_offset_px * self.dpi_scale_factor;
+    let mut pen_x = start_s;
 
-    let outline_enabled = style.outline_width > 0.0 && !style.outline_color.is_transparent();
-    let outline_px = style.outline_width * self.dpi_scale_factor;
+    for g in &glyphs {
+        let mut gmin_x = f32::INFINITY;
+        let mut gmax_x = f32::NEG_INFINITY;
+        for v in &g.vertices {
+            gmin_x = gmin_x.min(v.position[0]);
+            gmax_x = gmax_x.max(v.position[0]);
+        }
+        if !gmin_x.is_finite() || !gmax_x.is_finite() { continue; }
 
-    // kecil tapi efektif untuk outline: 8 arah
-    const OUT_DIRS: &[(f32, f32)] = &[
-        (-1.0, 0.0),
-        ( 1.0, 0.0),
-        ( 0.0,-1.0),
-        ( 0.0, 1.0),
-        (-0.707,-0.707),
-        (-0.707, 0.707),
-        ( 0.707,-0.707),
-        ( 0.707, 0.707),
-    ];
+        let adv = (gmax_x - gmin_x).max(0.0);
+        if adv <= 0.01 { continue; }
+        if pen_x > total_len_px { break; }
 
-    // render satu glyph di anchor/angle tertentu (opsional outline + fill)
-    // ✅ biarkan Rust infer type dari glyphs, jangan pakai annotation object type.
-    let mut emit_glyph = |g: crate::render::text::TessellatedGlyph,
-                          anchor: [f32; 3],
-                          ang: f32,
-                          glyph_center_x: f32| {
+        let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
+        let (anchor, ang) = sample(s_px);
         let (sin_a, cos_a) = ang.sin_cos();
+
         let nx = -sin_a;
-        let ny =  cos_a;
+        let ny = cos_a;
 
-        // siapkan warna + alpha fade
-        let mut fill_col = style.font_color.to_f32_array();
-        fill_col[3] *= alpha;
+        let vertices_start = self.poly_tessellation.vertices.len() as u32;
+        let glyph_center_x = gmin_x + adv * 0.5;
 
-        let mut outline_col = style.outline_color.to_f32_array();
-        outline_col[3] *= alpha;
+        for (gi, g) in glyphs.iter().enumerate() {
+    let is_outline = outline_enabled && gi < outline_split;
 
-        // OUTLINE PASS
-        if outline_enabled && outline_col[3] > 0.001 {
-            for (dxo, dyo) in OUT_DIRS {
-                let vertices_start = self.poly_tessellation.vertices.len() as u32;
+    // kompensasi: outline ditarik balik sedikit ke arah normal
+    let outline_comp = if is_outline { -style.outline_width * 0.5 } else { 0.0 };
 
-                for v in &g.vertices {
-                    let lx = v.position[0] - glyph_center_x;
-                    let ly = v.position[1];
+    // (opsional tapi disarankan) override warna berdasarkan pass
+    let pass_color = if is_outline { style.outline_color } else { style.font_color };
 
-                    let rx_px = lx * cos_a - ly * sin_a + nx * base_off + dxo * outline_px;
-                    let ry_px = lx * sin_a + ly * cos_a + ny * base_off + dyo * outline_px;
+    // ... hitung gmin/gmax/adv seperti biasa ...
 
-                    self.poly_tessellation.vertices.push(PolyVertex {
-                        position: anchor,
-                        normal: [rx_px, ry_px],
-                        color: outline_col,
-                        norm_limit: f32::MAX,
-                    });
-                }
+    for v in &g.vertices {
+        let lx = v.position[0] - glyph_center_x;
+        let ly = v.position[1];
 
-                for idx in &g.indices {
-                    self.poly_tessellation.indices.push(*idx + vertices_start);
-                }
-            }
-        }
+        let rx_px = lx * cos_a - ly * sin_a + nx * (line_offset_px + outline_comp);
+        let ry_px = lx * sin_a + ly * cos_a + ny * (line_offset_px + outline_comp);
 
-        // FILL PASS
-        if fill_col[3] > 0.001 {
-            let vertices_start = self.poly_tessellation.vertices.len() as u32;
-
-            for v in &g.vertices {
-                let lx = v.position[0] - glyph_center_x;
-                let ly = v.position[1];
-
-                let rx_px = lx * cos_a - ly * sin_a + nx * base_off;
-                let ry_px = lx * sin_a + ly * cos_a + ny * base_off;
-
-                self.poly_tessellation.vertices.push(PolyVertex {
-                    position: anchor,
-                    normal: [rx_px, ry_px],
-                    color: fill_col,
-                    norm_limit: f32::MAX,
-                });
-            }
-
-            for idx in &g.indices {
-                self.poly_tessellation.indices.push(*idx + vertices_start);
-            }
-        }
-    };
-
-    // render satu "run" label dari start_s_px (px sepanjang path), dengan opsi flip
-    let mut render_run = |start_s_px: f32, flip: bool| {
-        if !flip {
-            let mut pen_x = start_s_px;
-
-            for g in &glyphs {
-                // advance dari bbox glyph
-                let mut gmin = f32::INFINITY;
-                let mut gmax = f32::NEG_INFINITY;
-                for v in &g.vertices {
-                    gmin = gmin.min(v.position[0]);
-                    gmax = gmax.max(v.position[0]);
-                }
-                if !gmin.is_finite() || !gmax.is_finite() {
-                    continue;
-                }
-
-                let adv = (gmax - gmin).max(0.0);
-                if adv <= 0.01 {
-                    continue;
-                }
-
-                if pen_x > total_len_px {
-                    break;
-                }
-
-                let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
-                let (anchor, ang) = sample(s_px);
-
-                let glyph_center_x = gmin + adv * 0.5;
-                emit_glyph(g.clone(), anchor, ang, glyph_center_x);
-
-                pen_x += adv;
-            }
-        } else {
-            // flipped: urutan glyph dibalik + angle + PI
-            let mut pen_x = start_s_px + label_w;
-
-            for g in glyphs.iter().rev() {
-                let mut gmin = f32::INFINITY;
-                let mut gmax = f32::NEG_INFINITY;
-                for v in &g.vertices {
-                    gmin = gmin.min(v.position[0]);
-                    gmax = gmax.max(v.position[0]);
-                }
-                if !gmin.is_finite() || !gmax.is_finite() {
-                    continue;
-                }
-
-                let adv = (gmax - gmin).max(0.0);
-                if adv <= 0.01 {
-                    continue;
-                }
-
-                pen_x -= adv;
-                if pen_x > total_len_px {
-                    continue;
-                }
-
-                let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
-                let (anchor, mut ang) = sample(s_px);
-                ang += std::f32::consts::PI;
-
-                let glyph_center_x = gmin + adv * 0.5;
-                emit_glyph(g.clone(), anchor, ang, glyph_center_x);
-            }
-        }
-    };
-
-    // placement: single vs repeat
-    if !repeat {
-        let start_s = (total_len_px - label_w) * 0.5 - min_x;
-        let (_ac, ang_c) = sample(total_len_px * 0.5);
-        let flip = keep_upright && ang_c.cos() < 0.0;
-        render_run(start_s, flip);
-    } else {
-        let step = min_distance_px.max(label_w + 8.0);
-        let edge_padding = step * 0.5;
-
-        let mut center = step * 0.5;
-        while center < total_len_px {
-            let start_s = center - label_w * 0.5 - min_x;
-
-            // anti-edge clutter (kurangi duplikat antar tile piece)
-            if start_s < edge_padding || (start_s + label_w) > (total_len_px - edge_padding) {
-                center += step;
-                continue;
-            }
-
-            let (_ac, ang_c) = sample(center);
-            let flip = keep_upright && ang_c.cos() < 0.0;
-            render_run(start_s, flip);
-
-            center += step;
-        }
+        self.poly_tessellation.vertices.push(PolyVertex {
+            position: anchor,
+            normal: [rx_px, ry_px],
+            color: pass_color.to_f32_array(), // ✅ bukan v.color, supaya outline/fill konsisten
+            norm_limit: f32::MAX,
+        });
     }
 
-    // update buffer size
+    for idx in &g.indices {
+        self.poly_tessellation.indices.push(*idx + vertices_start);
+    }
+
+    pen_x += adv;
+}
+
+        for idx in &g.indices {
+            self.poly_tessellation.indices.push(*idx + vertices_start);
+        }
+
+        pen_x += adv;
+    }
+
     let vtx_added = self.poly_tessellation.vertices.len() - vtx_start_all;
     let idx_added = self.poly_tessellation.indices.len() - idx_start_all;
     self.buffer_size += vtx_added * std::mem::size_of::<PolyVertex>();
     self.buffer_size += idx_added * std::mem::size_of::<u32>();
-}
+    }
 
 fn build_path_metrics_px(
     pts: &[[f32; 3]],

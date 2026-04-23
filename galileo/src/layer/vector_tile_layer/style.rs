@@ -113,6 +113,10 @@ pub enum VectorTileSymbol {
     /// Symbol for a point object that is renderred as a text label.
     #[serde(rename = "label")]
     Label(VectorTileLabelSymbol),
+ /// Symbol for a line object that is renderred as a text label.
+#[serde(rename = "line_label")]
+    LineLabel(VectorTileLineLabelSymbol),
+
 }
 
 impl VectorTileSymbol {
@@ -147,6 +151,15 @@ impl VectorTileSymbol {
             _ => None,
         }
     }
+
+pub(crate) fn line_label(&self) -> Option<&VectorTileLineLabelSymbol> {
+        match self {
+            Self::LineLabel(symbol) => Some(symbol),
+            _ => None,
+        }
+    }
+
+
 }
 
 /// Symbol for point geometries.
@@ -315,3 +328,40 @@ mod tests {
             bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
     }
 }
+
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VectorTileLineLabelSymbol {
+    /// Text pattern, bisa pakai {name} dll
+    pub pattern: String,
+
+    /// Text style (sama seperti label point)
+    pub text_style: VtTextStyle,
+
+    /// Offset dari garis dalam pixel (opsional)
+    #[serde(default = "default_line_label_offset",alias = "offset")]
+    pub line_offset_px: NumExpr,
+     /// text terdekat (opsional)
+    #[serde(default ="default_line_label_distance", alias = "min_distance")]
+    pub min_distance_px: NumExpr,
+    /// keep upright (default true)
+    #[serde(default = "default_keep_upright")]
+    pub keep_upright: bool,
+    /// repeate
+    #[serde(default)]
+    pub repeat: bool,
+
+
+}
+
+fn default_line_label_offset() -> NumExpr {
+    0.0.into()
+}
+
+
+fn default_line_label_distance() -> NumExpr {
+    60.0.into()
+}
+
+fn default_keep_upright() -> bool { true }

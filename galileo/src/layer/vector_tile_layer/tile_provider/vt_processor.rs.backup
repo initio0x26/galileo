@@ -5,7 +5,6 @@ use galileo_types::impls::{ClosedContour, Polygon};
 use galileo_types::{Contour, MultiContour, MultiPolygon, Polygon as PolygonTrait};
 use num_traits::ToPrimitive;
 use regex::Regex;
-use std::collections::HashSet;
 
 use crate::TileSchema;
 use crate::error::GalileoError;
@@ -89,15 +88,6 @@ impl VtProcessor {
                 ))
             })?;
 
-        
-let tile_ptr = mvt_tile as *const _ as usize;
-log::warn!(
-    "VT_PREPARE: tile_ptr={} tile=z{} x={} y={} view_res={}",
-    tile_ptr, index.z, index.x, index.y, view_resolution
-);
-
-
-
         let tile_resolution = lod_resolution * tile_schema.tile_width() as f64;
         let width = tile_schema.tile_width() as f64;
         let height = tile_schema.tile_height() as f64;
@@ -116,12 +106,6 @@ log::warn!(
         );
 
         bundle.world_set.clip_area(&bounds);
-
-
-        // ✅ DEDUPE per-tile: cegah label line_label yang sama tergambar 2x di lokasi sama
-        // key = (text, qx, qy) dimana qx/qy = quantized midpoint (pixel-ish).
-        let mut dedup_line_labels: HashSet<(String, i64, i64)> = HashSet::new();
-        let mut seen_feature_text: HashSet<(usize, String)> = HashSet::new();
 
         for rule in &style.rules {
             if rule.max_resolution.is_some_and(|v| v < lod_resolution) {
@@ -194,20 +178,9 @@ log::warn!(
                                 if let Some((text, text_style, line_offset_px)) =
                                     Self::format_line_label(line_label, feature, expr_view_view)
                                 {
-
                                     if text.is_empty() || text_style.font_size < 12.0 {
                                         continue;
                                     }
-
-
-
-                                    // ===== DEDUPE GATE: HARUS DI SINI (sebelum log) =====
-                                    let fid_ptr = feature as *const _ as usize;
-                                    if !seen_feature_text.insert((fid_ptr, text.clone())) {
-                                        continue; // sudah pernah diproses pada tile ini
-                                    }
-                                    // ====================================================
-
 
                                     let min_distance_px = line_label
                                         .min_distance_px
@@ -217,18 +190,10 @@ log::warn!(
                                     let repeat = line_label.repeat;
                                     let keep_upright = line_label.keep_upright;
 
-                                    // log untuk debug: feature pointer
-                                    let fid_ptr = feature as *const _ as usize;
-                                    log::warn!(
-                                            "LINE_LABEL draw: tile=z{} x{} y{} layer={} fid_ptr={} text='{}' minDistPx={}",
-                                            index.z, index.x, index.y, layer.name, fid_ptr, text, min_distance_px
-                                            );
-
-
                                     let mut label_pts: Vec<Vec<Point3>> = Vec::new();
 
                                     if repeat {
-                                        // repeat: semua contour
+                                        // ✅ repeat: semua contour
                                         for contour in contours.contours() {
                                             let pts: Vec<Point3> = contour
                                                 .iter_points()
@@ -240,7 +205,7 @@ log::warn!(
                                             }
                                         }
                                     } else {
-                                        // repeat:false: pilih contour TERPANJANG
+                                        // ✅ repeat:false: pilih contour TERPANJANG
                                         let mut best_pts: Option<Vec<Point3>> = None;
                                         let mut best_len_px: f32 = 0.0;
 
@@ -267,43 +232,37 @@ log::warn!(
                                             continue;
                                         }
 
-                                        // anti-duplicate antar tile (ownership)
-                                        // NOTE: untuk repeat=false lebih aman lebih ketat
-                                        let pad_px = min_distance_px.max(256.0);
+                                        // anti-duplicate antar tile
+                                        let pad_px = min_distance_px.max(256.0); 
                                         let pad_world = view_resolution * (pad_px as f64);
-
-                                        // midpoint (dipakai untuk ownership + dedupe)
-                                        let mid = match Self::midpoint_by_world_length(&best_pts) {
-                                            Some(m) => m,
-                                            None => continue,
-                                        };
-
-                                        if !Self::inside_bbox_with_padding(&mid, bbox, pad_world) {
+                                        if let Some(mid) = Self::midpoint_by_world_length(&best_pts) {
+                                            if !Self::inside_bbox_with_padding(&mid, bbox, pad_world) {
+                                                continue;
+                                            }
+                                        }
+                                        else {
                                             continue;
                                         }
-
+                                        
+                                        
                                         let near_edge = |p: &Point3| !Self::inside_bbox_with_padding(p, bbox, pad_world);
                                         if near_edge(&best_pts[0]) || near_edge(best_pts.last().unwrap()) {
                                             continue;
                                         }
 
-                                        // ✅ DEDUPE: jika ada 2 feature menghasilkan text sama di lokasi sama, skip salah satu
-                                        // quantize midpoint ke pixel-ish supaya stabil
-                                        let qx = (mid.x() / view_resolution.max(1e-12)).round() as i64;
-                                        let qy = (mid.y() / view_resolution.max(1e-12)).round() as i64;
-
-                                        let key = (text.clone(), qx, qy);
-                                        if !dedup_line_labels.insert(key) {
-                                            // sudah pernah digambar di tile ini → skip
-                                            continue;
-                                        }
 
                                         label_pts.push(best_pts);
                                     }
 
-                                    // render
+                                    // ✅ SATU loop render (tidak duplikat)
                                     for pts in label_pts {
                                         let geom = galileo_types::impls::Contour::new(pts, false);
+
+
+                                    log::warn!(
+                                    "LINE_LABEL draw: z={} layer={} text='{}' repeat={} minDistPx={}",
+                                    index.z, layer.name, text, repeat, min_distance_px
+                                    );
 
                                         bundle.world_set.add_label_on_path(
                                             &geom,
@@ -316,12 +275,25 @@ log::warn!(
                                             view_resolution,
                                         );
                                     }
+
+                                    
                                 }
+
+                            
+                            
+
+                            
+
                             }
+
+
+
+
                         }
 
                         MvtGeometry::Polygon(polygons) => {
-                            if let Some(paint) = Self::get_polygon_symbol(rule, feature, expr_view_lod)
+                            if let Some(paint) =
+                                Self::get_polygon_symbol(rule, feature, expr_view_lod)
                             {
                                 for polygon in polygons.polygons() {
                                     bundle.add_polygon(
@@ -390,7 +362,9 @@ log::warn!(
         feature: &MvtFeature,
         view: ExprView,
     ) -> Option<PolygonPaint> {
-        rule.symbol.polygon().and_then(|s| s.to_paint(feature, view))
+        rule.symbol
+            .polygon()
+            .and_then(|s| s.to_paint(feature, view))
     }
 
     fn transform_polygon(mvt_polygon: &MvtPolygon, tile_resolution: f64) -> Polygon<Point3> {
@@ -474,18 +448,41 @@ log::warn!(
     }
 
     #[inline]
-    fn polyline_len_px(pts: &[Point3], view_resolution: f64) -> f32 {
-        if pts.len() < 2 {
-            return 0.0;
-        }
 
-        let mut total_world = 0.0_f64;
-        for i in 0..pts.len() - 1 {
-            let dx = pts[i + 1].x() - pts[i].x();
-            let dy = pts[i + 1].y() - pts[i].y();
-            total_world += (dx * dx + dy * dy).sqrt();
-        }
-
-        (total_world / view_resolution.max(1e-12)) as f32
-    }
+fn contour_to_pts<C, P>(
+    contour: &C,
+    tile_resolution: f64,
+) -> Vec<Point3>
+where
+    C: galileo_types::contour::Contour<Point = P>,
+    P: galileo_types::cartesian::CartesianPoint3d<Num = f64>,
+{
+    contour
+        .iter_points()
+        .map(|p| Self::transform_point(&Point2::new(p.x(), p.y()), tile_resolution))
+        .collect()
 }
+
+
+#[inline]
+fn polyline_len_px(pts: &[Point3], view_resolution: f64) -> f32 {
+    if pts.len() < 2 {
+        return 0.0;
+    }
+
+    let mut total_world = 0.0_f64;
+    for i in 0..pts.len() - 1 {
+        let dx = pts[i + 1].x() - pts[i].x();
+        let dy = pts[i + 1].y() - pts[i].y();
+        total_world += (dx * dx + dy * dy).sqrt();
+    }
+
+    (total_world / view_resolution.max(1e-12)) as f32
+}
+
+
+}
+
+
+
+

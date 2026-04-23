@@ -44,5 +44,6 @@ pub trait VectorTileProcessor: MaybeSend + MaybeSync {
         tile: Arc<MvtTile>,
         index: TileIndex,
         style_id: VtStyleId,
+        view_resolution: f64,
     ) -> Result<RenderBundle, TileProcessingError>;
 }

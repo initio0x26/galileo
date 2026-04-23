@@ -725,8 +725,7 @@ impl WorldRenderSet {
             }
         }
     }
-
-    /// Add label that follows a path (Contour / LineString).
+/// Add label that follows a path (Contour / LineString).
 ///
 /// Semua offset disimpan dalam *pixel* (normal) dan shader map_ref mengubahnya ke world
 /// menggunakan transform.resolution (satu kali).
@@ -751,40 +750,7 @@ pub fn add_label_on_path<N, P, C>(
     P: CartesianPoint3d<Num = N> + Copy,
     C: Contour<Point = P>,
 {
-    // -----------------------------
-    // 0) Readability guards (zoom threshold + fade)
-    // -----------------------------
-    // min_resolution = world units per pixel (semakin besar => semakin zoom-out)
-    //
-    // Anda bisa adjust angka ini sesuai "feel" map Anda:
-    // - RES_FADE_START: mulai memudar (masih tampil)
-    // - RES_HIDE: lewat ini, label hilang total (untuk mencegah clutter)
-    const RES_FADE_START: f64 = 2.5;
-    const RES_HIDE: f64 = 5.0;
-
-    #[inline]
-    fn fade_alpha(res: f64, fade_start: f64, hide: f64) -> f32 {
-        if res <= fade_start {
-            1.0
-        } else if res >= hide {
-            0.0
-        } else {
-            let t = ((res - fade_start) / (hide - fade_start)) as f32;
-            1.0 - t
-        }
-    }
-
-    let alpha = fade_alpha(min_resolution, RES_FADE_START, RES_HIDE);
-    if alpha <= 0.001 {
-        return; // hard hide saat zoom-out terlalu jauh
-    }
-
-    // Optional: matikan repeat otomatis ketika zoom-out (biar tidak penuh)
-    // Kalau Anda ingin repeat tetap aktif sampai batas tertentu, ubah RES_REPEAT_MAX.
-    const RES_REPEAT_MAX: f64 = 2.8;
-    let repeat = repeat && (min_resolution <= RES_REPEAT_MAX);
-
-    // guard dasar
+    // guard
     if text.is_empty() || style.font_size < 12.0 {
         return;
     }
@@ -825,12 +791,10 @@ pub fn add_label_on_path<N, P, C>(
     // helper: sample anchor (world) + tangent angle at distance s_px
     let sample = |s_px: f32| -> ([f32; 3], f32) {
         let s_px = s_px.clamp(0.0, total_len_px);
-
         let mut idx = 0usize;
         while idx + 1 < cum_len_px.len() && cum_len_px[idx + 1] < s_px {
             idx += 1;
         }
-
         let a = cum_len_px[idx];
         let b = cum_len_px[idx + 1];
         let t = if b > a { (s_px - a) / (b - a) } else { 0.0 };
@@ -858,15 +822,8 @@ pub fn add_label_on_path<N, P, C>(
     if !min_x.is_finite() || !max_x.is_finite() {
         return;
     }
-
     let label_w = (max_x - min_x).max(0.0);
     if label_w <= 0.0 || label_w >= total_len_px {
-        return;
-    }
-
-    // Optional: jangan render kalau label terlalu kecil secara pixel (anti "semut")
-    const MIN_LABEL_PX: f32 = 28.0;
-    if label_w < MIN_LABEL_PX {
         return;
     }
 
@@ -882,74 +839,43 @@ pub fn add_label_on_path<N, P, C>(
 
     // kecil tapi efektif untuk outline: 8 arah
     const OUT_DIRS: &[(f32, f32)] = &[
-        (-1.0, 0.0),
-        ( 1.0, 0.0),
-        ( 0.0,-1.0),
-        ( 0.0, 1.0),
-        (-0.707,-0.707),
-        (-0.707, 0.707),
-        ( 0.707,-0.707),
-        ( 0.707, 0.707),
+        (-1.0,  0.0),
+        ( 1.0,  0.0),
+        ( 0.0, -1.0),
+        ( 0.0,  1.0),
+        (-0.707, -0.707),
+        (-0.707,  0.707),
+        ( 0.707, -0.707),
+        ( 0.707,  0.707),
     ];
 
     // render satu glyph di anchor/angle tertentu (opsional outline + fill)
-    // ✅ biarkan Rust infer type dari glyphs, jangan pakai annotation object type.
-    let mut emit_glyph = |g: crate::render::text::TessellatedGlyph,
-                          anchor: [f32; 3],
-                          ang: f32,
-                          glyph_center_x: f32| {
-        let (sin_a, cos_a) = ang.sin_cos();
-        let nx = -sin_a;
-        let ny =  cos_a;
+    // render satu glyph di anchor/angle tertentu (opsional outline + fill)
+// ✅ jangan beri type annotation: biarkan Rust infer dari `glyphs`
+let mut emit_glyph = |g:crate::render::text::TessellatedGlyph,
+                      anchor: [f32; 3],
+                      ang: f32,
+                      glyph_center_x: f32| {
+    let (sin_a, cos_a) = ang.sin_cos();
+    let nx = -sin_a;
+    let ny = cos_a;
 
-        // siapkan warna + alpha fade
-        let mut fill_col = style.font_color.to_f32_array();
-        fill_col[3] *= alpha;
-
-        let mut outline_col = style.outline_color.to_f32_array();
-        outline_col[3] *= alpha;
-
-        // OUTLINE PASS
-        if outline_enabled && outline_col[3] > 0.001 {
-            for (dxo, dyo) in OUT_DIRS {
-                let vertices_start = self.poly_tessellation.vertices.len() as u32;
-
-                for v in &g.vertices {
-                    let lx = v.position[0] - glyph_center_x;
-                    let ly = v.position[1];
-
-                    let rx_px = lx * cos_a - ly * sin_a + nx * base_off + dxo * outline_px;
-                    let ry_px = lx * sin_a + ly * cos_a + ny * base_off + dyo * outline_px;
-
-                    self.poly_tessellation.vertices.push(PolyVertex {
-                        position: anchor,
-                        normal: [rx_px, ry_px],
-                        color: outline_col,
-                        norm_limit: f32::MAX,
-                    });
-                }
-
-                for idx in &g.indices {
-                    self.poly_tessellation.indices.push(*idx + vertices_start);
-                }
-            }
-        }
-
-        // FILL PASS
-        if fill_col[3] > 0.001 {
+    // OUTLINE PASS (anchor/rotasi sama, cuma offset kecil + warna outline)
+    if outline_enabled {
+        for (dxo, dyo) in OUT_DIRS {
             let vertices_start = self.poly_tessellation.vertices.len() as u32;
 
             for v in &g.vertices {
                 let lx = v.position[0] - glyph_center_x;
                 let ly = v.position[1];
 
-                let rx_px = lx * cos_a - ly * sin_a + nx * base_off;
-                let ry_px = lx * sin_a + ly * cos_a + ny * base_off;
+                let rx_px = lx * cos_a - ly * sin_a + nx * base_off + dxo * outline_px;
+                let ry_px = lx * sin_a + ly * cos_a + ny * base_off + dyo * outline_px;
 
                 self.poly_tessellation.vertices.push(PolyVertex {
                     position: anchor,
                     normal: [rx_px, ry_px],
-                    color: fill_col,
+                    color: style.outline_color.to_f32_array(),
                     norm_limit: f32::MAX,
                 });
             }
@@ -958,8 +884,32 @@ pub fn add_label_on_path<N, P, C>(
                 self.poly_tessellation.indices.push(*idx + vertices_start);
             }
         }
-    };
+    }
 
+    // FILL PASS
+    {
+        let vertices_start = self.poly_tessellation.vertices.len() as u32;
+
+        for v in &g.vertices {
+            let lx = v.position[0] - glyph_center_x;
+            let ly = v.position[1];
+
+            let rx_px = lx * cos_a - ly * sin_a + nx * base_off;
+            let ry_px = lx * sin_a + ly * cos_a + ny * base_off;
+
+            self.poly_tessellation.vertices.push(PolyVertex {
+                position: anchor,
+                normal: [rx_px, ry_px],
+                color: style.font_color.to_f32_array(),
+                norm_limit: f32::MAX,
+            });
+        }
+
+        for idx in &g.indices {
+            self.poly_tessellation.indices.push(*idx + vertices_start);
+        }
+    }
+};
     // render satu "run" label dari start_s_px (px sepanjang path), dengan opsi flip
     let mut render_run = |start_s_px: f32, flip: bool| {
         if !flip {
@@ -976,20 +926,18 @@ pub fn add_label_on_path<N, P, C>(
                 if !gmin.is_finite() || !gmax.is_finite() {
                     continue;
                 }
-
                 let adv = (gmax - gmin).max(0.0);
                 if adv <= 0.01 {
                     continue;
                 }
-
                 if pen_x > total_len_px {
                     break;
                 }
 
                 let s_px = (pen_x + adv * 0.5).clamp(0.0, total_len_px);
                 let (anchor, ang) = sample(s_px);
-
                 let glyph_center_x = gmin + adv * 0.5;
+
                 emit_glyph(g.clone(), anchor, ang, glyph_center_x);
 
                 pen_x += adv;
@@ -1008,7 +956,6 @@ pub fn add_label_on_path<N, P, C>(
                 if !gmin.is_finite() || !gmax.is_finite() {
                     continue;
                 }
-
                 let adv = (gmax - gmin).max(0.0);
                 if adv <= 0.01 {
                     continue;
@@ -1051,8 +998,8 @@ pub fn add_label_on_path<N, P, C>(
 
             let (_ac, ang_c) = sample(center);
             let flip = keep_upright && ang_c.cos() < 0.0;
-            render_run(start_s, flip);
 
+            render_run(start_s, flip);
             center += step;
         }
     }
